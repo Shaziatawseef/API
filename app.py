@@ -28,7 +28,7 @@ COOKIE_FILE = Path("/tmp/youtube-cookies.txt")
 
 
 def get_cookie_file():
-    cookie_data = ("# Netscape HTTP Cookie File
+    cookie_data = """# Netscape HTTP Cookie File
 # Generated locally by ToolMi.
 
 .youtube.com	TRUE	/	TRUE	0	__Secure-1PAPISID	W-qx8vOUsPw3FdsT/AuPQ3OSc86j22wtrO
@@ -47,7 +47,7 @@ def get_cookie_file():
 .youtube.com	TRUE	/	FALSE	0	SID	g.a000EgmeBOg4hD9O89M5qnyiyLgKkwiXKSP7vSbIGxed1qSCqFYe9o8d1dY62Oi17B7pN4PdigACgYKAeUSARcSFQHGX2Mid0e7Ew-RHW6zg-yNRYuHUBoVAUF8yKp6PeenRaSbsDvVAh2XSEna0076
 .youtube.com	TRUE	/	FALSE	0	SIDCC	APD_SKFa4qvDjw1LKOk1TYhXt9EoFLn5y8QINuTyJO1t8rEuN_5GBGBzc3U6YuXUmQZoR7WVzw
 #HttpOnly_.youtube.com	TRUE	/	TRUE	0	SSID	AQ9u3iJcFPP8Ri2R5
-").strip()
+""".strip()
 
     if not cookie_data:
         return None
