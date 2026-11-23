@@ -319,7 +319,15 @@ def build_ydl_options():
 
         "ignore_no_formats_error": True,
 
-        "extractor_retries": 2,
+        # Cookie-free diagnostic optimization.
+        # Skip the initial YouTube webpage request.
+        "extractor_args": {
+            "youtube": {
+                "player_skip": ["webpage"],
+            }
+        },
+
+        "extractor_retries": 1,
         "retries": 1,
         "fragment_retries": 1,
 
@@ -443,6 +451,7 @@ def select_best_format(formats, media_type):
 
     Video-only selection is restricted to ordinary HTTP/HTTPS media
     URLs so the API does not return HLS .m3u8 playlists as its video URL.
+
     Audio and combined streams prefer direct HTTP/HTTPS URLs whenever
     available, while retaining a fallback if YouTube exposes no direct URL.
     """
