@@ -39,7 +39,7 @@ logger = logging.getLogger("media-api")
 # ============================================================
 
 APP_NAME = "Media Extraction API"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -51,7 +51,7 @@ PORT = int(os.getenv("SERVER_PORT", os.getenv("PORT", "10000")))
 POT_PROVIDER_URL = os.getenv(
     "POT_PROVIDER_URL",
     "http://127.0.0.1:4416",
-)
+).rstrip("/")
 
 DOWNLOAD_TIMEOUT = 120
 
@@ -90,7 +90,6 @@ def initialize_runtime():
         )
 
         version = result.stdout.strip()
-
         major = int(version.lstrip("v").split(".")[0])
 
         if major < 22:
@@ -278,8 +277,15 @@ def build_ydl_options():
             "Accept-Language": "en-US,en;q=0.9",
         },
 
-        # BgUtils PO Token Provider
+        # YouTube PO Token configuration
         "extractor_args": {
+
+            # Recommended client for GVS PO Tokens
+            "youtube": {
+                "player_client": ["mweb"],
+            },
+
+            # BgUtils HTTP PO Token provider
             "youtubepot-bgutilhttp": {
                 "base_url": POT_PROVIDER_URL,
             },
@@ -510,8 +516,10 @@ def extract_video(url):
     options = build_ydl_options()
 
     logger.info(
-        "Starting extraction. PO provider ready: %s",
+        "Starting extraction. PO provider ready: %s; "
+        "YouTube client: mweb; cookies configured: %s",
         POT_READY,
+        bool(os.getenv("YOUTUBE_COOKIES", "").strip()),
     )
 
     with YoutubeDL(options) as ydl:
@@ -554,6 +562,7 @@ def extract_video(url):
                     "cookies_configured": bool(
                         os.getenv("YOUTUBE_COOKIES", "").strip()
                     ),
+                    "youtube_client": "mweb",
                     "po_token_provider_ready": POT_READY,
                     "po_token_provider_error": POT_ERROR,
                 },
@@ -561,7 +570,8 @@ def extract_video(url):
                 "possible_causes": [
                     "YouTube player challenge",
                     "Authentication requirement",
-                    "PO Token requirement",
+                    "PO Token generation failure",
+                    "HTTP 429 rate limit",
                     "Age or region restriction",
                     "Unavailable video formats",
                     "Server IP restriction",
@@ -669,6 +679,8 @@ def home():
             os.getenv("YOUTUBE_COOKIES", "").strip()
         ),
 
+        "youtube_client": "mweb",
+
         "po_token_provider": {
             "enabled": True,
             "ready": POT_READY,
@@ -708,6 +720,8 @@ def health():
         "cookies_configured": bool(
             os.getenv("YOUTUBE_COOKIES", "").strip()
         ),
+
+        "youtube_client": "mweb",
 
         "po_token_provider_ready": POT_READY,
         "po_token_provider_error": POT_ERROR,
