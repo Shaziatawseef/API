@@ -279,17 +279,13 @@ def build_ydl_options():
 
         # YouTube PO Token configuration
         "extractor_args": {
-
-            # Recommended client for GVS PO Tokens
-            "youtube": {
-                "player_client": ["mweb"],
-            },
-
-            # BgUtils HTTP PO Token provider
-            "youtubepot-bgutilhttp": {
-                "base_url": POT_PROVIDER_URL,
-            },
-        },
+    "youtube": {
+        "player_client": ["mweb", "tv", "web_safari"],
+    },
+    "youtubepot-bgutilhttp": {
+        "base_url": POT_PROVIDER_URL,
+    },
+},
     }
 
     # JavaScript challenge solver
