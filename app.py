@@ -9,10 +9,10 @@ import socket
 import subprocess
 import threading
 import time
-
-from pathlib import Path
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import yt_dlp
 import uvicorn
@@ -23,61 +23,71 @@ from yt_dlp.utils import DownloadError
 
 
 # ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_NAME = "Media Extraction API"
+APP_VERSION = "2.3.0"
+
+BASE_DIR = Path(__file__).resolve().parent
+
+CACHE_DIR = Path("/tmp/yt-dlp-cache")
+
+PORT = int(
+    os.getenv(
+        "SERVER_PORT",
+        os.getenv("PORT", "10000")
+    )
+)
+
+POT_PROVIDER_URL = os.getenv(
+    "POT_PROVIDER_URL",
+    "http://127.0.0.1:4416"
+).rstrip("/")
+
+DOWNLOAD_TIMEOUT = int(
+    os.getenv("DOWNLOAD_TIMEOUT", "120")
+)
+
+NODE_PATH = shutil.which("node")
+
+NODE_READY = False
+NODE_VERSION = None
+
+POT_PROVIDER_READY = False
+
+EXTRACTION_LOCK = threading.Semaphore(1)
+
+START_TIME = time.time()
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 
 logger = logging.getLogger("media-api")
 
 
 # ============================================================
-# CONFIGURATION
-# ============================================================
-
-APP_NAME = "Media Extraction API"
-APP_VERSION = "2.2.0"
-
-BASE_DIR = Path(__file__).resolve().parent
-
-COOKIE_FILE = Path("/tmp/youtube-cookies.txt")
-CACHE_DIR = Path("/tmp/yt-dlp-cache")
-
-PORT = int(os.getenv("SERVER_PORT", os.getenv("PORT", "10000")))
-
-POT_PROVIDER_URL = os.getenv(
-    "POT_PROVIDER_URL",
-    "http://127.0.0.1:4416",
-).rstrip("/")
-
-DOWNLOAD_TIMEOUT = 120
-
-NODE_READY = False
-NODE_ERROR = None
-NODE_PATH = None
-
-POT_READY = False
-POT_ERROR = None
-
-EXTRACTION_LOCK = threading.Semaphore(1)
-
-
-# ============================================================
-# NODE.JS RUNTIME
+# RUNTIME INITIALIZATION
 # ============================================================
 
 def initialize_runtime():
-    global NODE_READY, NODE_ERROR, NODE_PATH
+    global NODE_READY, NODE_VERSION
 
     NODE_PATH = shutil.which("node")
 
     if not NODE_PATH:
         NODE_READY = False
-        NODE_ERROR = "Node.js was not found in PATH."
-        logger.error(NODE_ERROR)
+        NODE_VERSION = None
+
+        logger.warning("Node.js was not found.")
+
         return
 
     try:
@@ -85,132 +95,115 @@ def initialize_runtime():
             [NODE_PATH, "--version"],
             capture_output=True,
             text=True,
-            timeout=10,
-            check=True,
+            timeout=10
         )
 
         version = result.stdout.strip()
-        major = int(version.lstrip("v").split(".")[0])
 
-        if major < 22:
-            raise RuntimeError(
-                f"Node.js 22 or newer is required. Found {version}"
+        NODE_VERSION = version
+
+        major = int(
+            version.lstrip("v").split(".")[0]
+        )
+
+        NODE_READY = major >= 22
+
+        if NODE_READY:
+            logger.info(
+                "Node.js runtime ready: %s",
+                version
             )
-
-        NODE_READY = True
-        NODE_ERROR = None
-
-        logger.info("Node.js ready: %s (%s)", NODE_PATH, version)
+        else:
+            logger.warning(
+                "Node.js version %s is below recommended v22.",
+                version
+            )
 
     except Exception as exc:
         NODE_READY = False
-        NODE_ERROR = str(exc)
-        logger.exception("Node.js initialization failed")
+        NODE_VERSION = None
 
-
-def runtime_info():
-    result = {}
-
-    if NODE_PATH and NODE_READY:
-        result["node"] = NODE_PATH
-
-    return result
+        logger.exception(
+            "Node.js initialization failed: %s",
+            exc
+        )
 
 
 # ============================================================
-# BGUTIL PO TOKEN PROVIDER
+# PO TOKEN PROVIDER
 # ============================================================
 
 def check_pot_provider():
-    """
-    Check whether the local BgUtils HTTP provider is reachable.
-    """
-
-    global POT_READY, POT_ERROR
-
-    parsed = urlparse(POT_PROVIDER_URL)
-
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 4416
+    global POT_PROVIDER_READY
 
     try:
+        parsed = urlparse(POT_PROVIDER_URL)
+
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 4416
+
+        # First check whether the provider port is reachable.
         with socket.create_connection(
             (host, port),
-            timeout=3,
+            timeout=3
         ):
-            POT_READY = True
-            POT_ERROR = None
+            pass
 
+        # Then check its HTTP health endpoint.
+        with urlopen(
+            f"{POT_PROVIDER_URL}/ping",
+            timeout=5
+        ) as response:
+
+            POT_PROVIDER_READY = (
+                response.status == 200
+            )
+
+        if POT_PROVIDER_READY:
             logger.info(
-                "BgUtils PO Token provider reachable at %s",
-                POT_PROVIDER_URL,
+                "PO Token provider is ready: %s",
+                POT_PROVIDER_URL
             )
 
     except Exception as exc:
-        POT_READY = False
-        POT_ERROR = str(exc)
+        POT_PROVIDER_READY = False
 
-        logger.error(
-            "BgUtils provider is unavailable: %s",
-            POT_ERROR,
+        logger.warning(
+            "PO Token provider is unavailable: %s",
+            exc
         )
+
+    return POT_PROVIDER_READY
 
 
 # ============================================================
-# COOKIES
+# RUNTIME INFORMATION
 # ============================================================
 
-def get_cookie_file():
-    """
-    Read Netscape-format cookies from YOUTUBE_COOKIES.
+def runtime_info():
 
-    Never hardcode account cookies in source code.
-    """
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
 
-    cookie_data = os.getenv(
-        "YOUTUBE_COOKIES",
-        "",
-    ).strip()
+        "node": NODE_READY,
+        "node_version": NODE_VERSION,
+        "node_path": NODE_PATH,
 
-    if not cookie_data:
-        try:
-            COOKIE_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
+        "yt_dlp_version": yt_dlp.version.__version__,
 
-        return None
+        "po_token_provider": POT_PROVIDER_READY,
+        "po_token_provider_url": POT_PROVIDER_URL,
 
-    if not cookie_data.startswith(
-        (
-            "# Netscape HTTP Cookie File",
-            "# HTTP Cookie File",
+        "youtube_client": "mweb",
+
+        "authentication_mode": "guest",
+        "cookies_configured": False,
+
+        "javascript_runtime": (
+            "node" if NODE_READY else None
         )
-    ):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Invalid YOUTUBE_COOKIES format. "
-                "Use Netscape cookies.txt."
-            ),
-        )
-
-    try:
-        COOKIE_FILE.write_text(
-            cookie_data + "\n",
-            encoding="utf-8",
-        )
-
-        COOKIE_FILE.chmod(0o600)
-
-        return str(COOKIE_FILE)
-
-    except OSError:
-        logger.exception("Cookie file preparation failed")
-
-        raise HTTPException(
-            status_code=500,
-            detail="Could not prepare cookie file.",
-        )
+    }
 
 
 # ============================================================
@@ -218,24 +211,33 @@ def get_cookie_file():
 # ============================================================
 
 def validate_url(url: str):
+
     try:
         parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
+
+        hostname = (parsed.hostname or "").lower()
+
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Only HTTP and HTTPS URLs are supported.")
 
         valid_host = (
-            host == "youtube.com"
-            or host.endswith(".youtube.com")
-            or host == "youtu.be"
-            or host.endswith(".youtu.be")
+            hostname == "youtube.com"
+            or hostname.endswith(".youtube.com")
+            or hostname == "youtu.be"
         )
 
-        if parsed.scheme not in ("http", "https") or not valid_host:
-            raise ValueError()
+        if not valid_host:
+            raise ValueError("Only YouTube URLs are supported.")
 
-    except Exception:
+        return url
+
+    except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail="Only valid YouTube URLs are supported.",
+            detail={
+                "error": "Invalid YouTube URL",
+                "message": str(exc)
+            }
         )
 
 
@@ -247,16 +249,23 @@ def build_ydl_options():
 
     options = {
         "quiet": True,
+
         "no_warnings": False,
-        "verbose": os.getenv("YTDLP_VERBOSE", "0") == "1",
+
+        "verbose": (
+            os.getenv("YTDLP_VERBOSE", "0") == "1"
+        ),
 
         "noplaylist": True,
+
         "skip_download": True,
 
         "ignore_no_formats_error": True,
 
         "extractor_retries": 2,
+
         "retries": 1,
+
         "fragment_retries": 1,
 
         "socket_timeout": 20,
@@ -265,44 +274,55 @@ def build_ydl_options():
 
         "paths": {
             "home": "/tmp",
-            "temp": "/tmp",
+            "temp": "/tmp"
         },
 
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
+
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,*/*;q=0.8"
+            ),
+
             "Accept-Language": "en-US,en;q=0.9",
+
+            "Sec-Fetch-Mode": "navigate"
         },
 
-        # YouTube PO Token configuration
+        # Guest mode:
+        # No Google account cookies.
+        # No cookies-from-browser.
+        # No manually supplied authentication.
+
         "extractor_args": {
-    "youtube": {
-        "player_client": ["mweb", "tv", "web_safari"],
-    },
-    "youtubepot-bgutilhttp": {
-        "base_url": POT_PROVIDER_URL,
-    },
-},
+            "youtube": {
+                "player_client": ["mweb"]
+            },
+
+            "youtubepot-bgutilhttp": {
+                "base_url": POT_PROVIDER_URL
+            }
+        }
     }
 
-    # JavaScript challenge solver
-    if NODE_READY:
+    # JavaScript challenge support.
+    if NODE_READY and NODE_PATH:
+
         options["js_runtimes"] = {
             "node": {
-                "path": NODE_PATH,
-            },
+                "path": NODE_PATH
+            }
         }
 
-        options["remote_components"] = ["ejs:github"]
-
-    # Optional cookies
-    cookie_file = get_cookie_file()
-
-    if cookie_file:
-        options["cookiefile"] = cookie_file
+        options["remote_components"] = [
+            "ejs:github"
+        ]
 
     return options
 
@@ -312,21 +332,44 @@ def build_ydl_options():
 # ============================================================
 
 def has_video(fmt):
+
     codec = fmt.get("vcodec")
-    return bool(codec and codec != "none")
+
+    return (
+        codec is not None
+        and codec != "none"
+    )
 
 
 def has_audio(fmt):
+
     codec = fmt.get("acodec")
-    return bool(codec and codec != "none")
+
+    return (
+        codec is not None
+        and codec != "none"
+    )
 
 
 def is_direct_stream(fmt):
-    return fmt.get("protocol") in ("https", "http")
+
+    protocol = str(
+        fmt.get("protocol") or ""
+    ).lower()
+
+    url = fmt.get("url")
+
+    return (
+        protocol in ("https", "http")
+        and bool(url)
+    )
 
 
 def stream_protocol_score(fmt):
-    protocol = fmt.get("protocol")
+
+    protocol = str(
+        fmt.get("protocol") or ""
+    ).lower()
 
     if protocol == "https":
         return 3
@@ -334,95 +377,34 @@ def stream_protocol_score(fmt):
     if protocol == "http":
         return 2
 
-    if protocol in ("http_dash_segments", "dash"):
-        return 1
-
     return 0
 
 
-def format_score(fmt, media_type):
-
-    protocol_score = stream_protocol_score(fmt)
-
-    filesize = (
-        fmt.get("filesize")
-        or fmt.get("filesize_approx")
-        or 0
-    )
-
-    if media_type == "video":
-        return (
-            fmt.get("height") or 0,
-            fmt.get("fps") or 0,
-            fmt.get("vbr") or fmt.get("tbr") or 0,
-            protocol_score,
-            filesize,
-        )
-
-    if media_type == "audio":
-        return (
-            fmt.get("abr") or fmt.get("tbr") or 0,
-            fmt.get("asr") or 0,
-            fmt.get("audio_channels") or 0,
-            protocol_score,
-            filesize,
-        )
+def format_score(fmt):
 
     return (
-        fmt.get("height") or 0,
-        fmt.get("fps") or 0,
-        fmt.get("vbr") or fmt.get("tbr") or 0,
-        fmt.get("abr") or 0,
-        protocol_score,
-        filesize,
+        int(fmt.get("quality") or 0),
+
+        int(fmt.get("height") or 0),
+
+        float(fmt.get("fps") or 0),
+
+        float(fmt.get("tbr") or 0),
+
+        stream_protocol_score(fmt),
+
+        int(fmt.get("filesize") or 0)
     )
 
 
-def select_best_format(formats, media_type):
+def select_best_format(formats):
 
-    candidates = []
-
-    for fmt in formats:
-
-        if not fmt.get("url"):
-            continue
-
-        if fmt.get("has_drm"):
-            continue
-
-        video = has_video(fmt)
-        audio = has_audio(fmt)
-
-        if media_type == "video" and video and not audio:
-
-            if is_direct_stream(fmt):
-                candidates.append(fmt)
-
-        elif media_type == "audio" and audio and not video:
-
-            candidates.append(fmt)
-
-        elif media_type == "combined" and video and audio:
-
-            candidates.append(fmt)
-
-    if not candidates:
+    if not formats:
         return None
 
-    if media_type != "video":
-
-        direct_candidates = [
-            fmt for fmt in candidates
-            if is_direct_stream(fmt)
-        ]
-
-        if direct_candidates:
-            candidates = direct_candidates
-
     return max(
-        candidates,
-        key=lambda fmt: format_score(fmt, media_type),
-        default=None,
+        formats,
+        key=format_score
     )
 
 
@@ -430,51 +412,53 @@ def select_best_format(formats, media_type):
 # STREAM INFORMATION
 # ============================================================
 
-def stream_info(fmt, media_type):
+def stream_info(fmt):
 
-    if not fmt:
-        return None
-
-    ext = fmt.get("ext")
-
-    if media_type == "audio":
-
-        bitrate = fmt.get("abr") or fmt.get("tbr")
-
-        if bitrate:
-            quality = (
-                "high" if bitrate >= 128
-                else "medium" if bitrate >= 96
-                else "low"
-            )
-        else:
-            quality = fmt.get("format_note") or "unknown"
-
-    else:
-
-        height = fmt.get("height")
-
-        quality = (
-            f"{height}p"
-            if height
-            else fmt.get("format_note") or "unknown"
-        )
-
-    result = {
-        "url": fmt.get("url"),
+    return {
         "format_id": fmt.get("format_id"),
-        "ext": ext,
-        "quality": quality,
+
+        "format": fmt.get("format"),
+
+        "ext": fmt.get("ext"),
+
+        "url": fmt.get("url"),
+
+        "protocol": fmt.get("protocol"),
+
+        "width": fmt.get("width"),
+
+        "height": fmt.get("height"),
+
+        "resolution": fmt.get("resolution"),
+
+        "fps": fmt.get("fps"),
+
+        "vcodec": fmt.get("vcodec"),
+
+        "acodec": fmt.get("acodec"),
+
+        "abr": fmt.get("abr"),
+
+        "vbr": fmt.get("vbr"),
+
+        "tbr": fmt.get("tbr"),
+
+        "asr": fmt.get("asr"),
+
+        "audio_channels": fmt.get("audio_channels"),
+
+        "filesize": fmt.get("filesize"),
+
+        "filesize_approx": fmt.get("filesize_approx"),
+
+        "format_note": fmt.get("format_note"),
+
+        "language": fmt.get("language"),
+
+        "quality": fmt.get("quality"),
+
+        "direct": is_direct_stream(fmt)
     }
-
-    if media_type == "audio":
-        result["bitrate"] = fmt.get("abr") or fmt.get("tbr")
-
-    elif media_type == "video":
-        result["width"] = fmt.get("width")
-        result["height"] = fmt.get("height")
-
-    return result
 
 
 # ============================================================
@@ -483,306 +467,508 @@ def stream_info(fmt, media_type):
 
 def classify_formats(formats):
 
-    best_combined = select_best_format(
-        formats,
-        "combined",
+    audio_formats = []
+    video_formats = []
+    combined_formats = []
+
+    for fmt in formats:
+
+        if not is_direct_stream(fmt):
+            continue
+
+        video = has_video(fmt)
+        audio = has_audio(fmt)
+
+        info = stream_info(fmt)
+
+        if video and audio:
+
+            combined_formats.append(info)
+
+        elif video:
+
+            video_formats.append(info)
+
+        elif audio:
+
+            audio_formats.append(info)
+
+    audio_formats.sort(
+        key=lambda x: (
+            x.get("abr") or 0,
+            x.get("tbr") or 0
+        ),
+        reverse=True
     )
 
-    best_audio = select_best_format(
-        formats,
-        "audio",
+    video_formats.sort(
+        key=lambda x: (
+            x.get("height") or 0,
+            x.get("fps") or 0,
+            x.get("tbr") or 0
+        ),
+        reverse=True
     )
 
-    best_video = select_best_format(
-        formats,
-        "video",
+    combined_formats.sort(
+        key=lambda x: (
+            x.get("height") or 0,
+            x.get("fps") or 0,
+            x.get("tbr") or 0
+        ),
+        reverse=True
     )
 
-    return best_combined, best_audio, best_video
+    return {
+        "audio": audio_formats,
+        "video": video_formats,
+        "combined": combined_formats
+    }
+
+
+# ============================================================
+# ERROR DIAGNOSTICS
+# ============================================================
+
+def build_diagnostics(video_id):
+
+    return {
+        "video_id": video_id,
+
+        "node": NODE_READY,
+
+        "node_version": NODE_VERSION,
+
+        "cookies_configured": False,
+
+        "authentication_mode": "guest",
+
+        "youtube_client": "mweb",
+
+        "po_token_provider": POT_PROVIDER_READY,
+
+        "po_token_provider_url": POT_PROVIDER_URL,
+
+        "yt_dlp_version": yt_dlp.version.__version__,
+
+        "possible_causes": [
+            "YouTube HTTP 429 rate limiting",
+
+            "YouTube IP reputation restriction",
+
+            "YouTube guest session LOGIN_REQUIRED",
+
+            "PO Token generation or validation failure",
+
+            "Video age or region restriction",
+
+            "Video unavailable or private"
+        ]
+    }
+
+
+def classify_extraction_error(message):
+
+    message = message.lower()
+
+    if "429" in message or "too many requests" in message:
+
+        return "YOUTUBE_RATE_LIMITED"
+
+    if (
+        "login_required" in message
+        or "sign in to confirm" in message
+        or "not a bot" in message
+    ):
+
+        return "YOUTUBE_GUEST_AUTH_REQUIRED"
+
+    if "private video" in message:
+
+        return "PRIVATE_VIDEO"
+
+    if "video unavailable" in message:
+
+        return "VIDEO_UNAVAILABLE"
+
+    return "EXTRACTION_FAILED"
 
 
 # ============================================================
 # VIDEO EXTRACTION
 # ============================================================
 
-def extract_video(url):
+def extract_video(url: str):
 
-    started = time.perf_counter()
+    validate_url(url)
+
+    video_id = None
+
+    logger.info(
+        "Starting guest-mode extraction. "
+        "PO provider ready: %s; "
+        "YouTube client: mweb; "
+        "cookies configured: False",
+        POT_PROVIDER_READY
+    )
+
+    CACHE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     options = build_ydl_options()
 
-    logger.info(
-        "Starting extraction. PO provider ready: %s; "
-        "YouTube client: mweb; cookies configured: %s",
-        POT_READY,
-        bool(os.getenv("YOUTUBE_COOKIES", "").strip()),
-    )
+    try:
 
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            url,
-            download=False,
+        with YoutubeDL(options) as ydl:
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
+
+        if not info:
+
+            raise ValueError(
+                "YouTube returned an empty response."
+            )
+
+        video_id = info.get("id")
+
+        formats = info.get("formats") or []
+
+        if not formats:
+
+            logger.warning(
+                "No formats returned for video ID: %s",
+                video_id
+            )
+
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "YouTube returned no playable formats.",
+
+                    "code": "NO_PLAYABLE_FORMATS",
+
+                    "video_id": video_id,
+
+                    "diagnostics": build_diagnostics(
+                        video_id
+                    )
+                }
+            )
+
+        streams = classify_formats(formats)
+
+        total_streams = (
+            len(streams["audio"])
+            + len(streams["video"])
+            + len(streams["combined"])
         )
 
-    if not info:
-        raise HTTPException(
-            status_code=404,
-            detail="No media information returned.",
+        if total_streams == 0:
+
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "No supported direct HTTP streams were found.",
+
+                    "code": "NO_DIRECT_STREAMS",
+
+                    "video_id": video_id,
+
+                    "diagnostics": build_diagnostics(
+                        video_id
+                    )
+                }
+            )
+
+        result = {
+            "success": True,
+
+            "service": APP_NAME,
+
+            "version": APP_VERSION,
+
+            "video_id": video_id,
+
+            "title": info.get("title"),
+
+            "thumbnail": info.get("thumbnail"),
+
+            "duration": info.get("duration"),
+
+            "duration_string": info.get("duration_string"),
+
+            "uploader": info.get("uploader"),
+
+            "channel": info.get("channel"),
+
+            "channel_url": info.get("channel_url"),
+
+            "view_count": info.get("view_count"),
+
+            "upload_date": info.get("upload_date"),
+
+            "webpage_url": info.get("webpage_url"),
+
+            "age_limit": info.get("age_limit"),
+
+            "streams": streams,
+
+            "total_formats": len(formats),
+
+            "total_direct_streams": total_streams,
+
+            "best": {
+                "audio": (
+                    streams["audio"][0]
+                    if streams["audio"]
+                    else None
+                ),
+
+                "video": (
+                    streams["video"][0]
+                    if streams["video"]
+                    else None
+                ),
+
+                "combined": (
+                    streams["combined"][0]
+                    if streams["combined"]
+                    else None
+                )
+            },
+
+            "authentication": {
+                "mode": "guest",
+                "cookies_used": False,
+                "youtube_client": "mweb"
+            }
+        }
+
+        logger.info(
+            "Extraction successful: %s | "
+            "Audio: %s | Video: %s | Combined: %s",
+            video_id,
+            len(streams["audio"]),
+            len(streams["video"]),
+            len(streams["combined"])
         )
 
-    if info.get("_type") == "playlist":
-        raise HTTPException(
-            status_code=400,
-            detail="Playlist URLs are not supported.",
-        )
+        return result
 
-    formats = info.get("formats") or []
+    except HTTPException:
 
-    if not formats:
+        raise
+
+    except DownloadError as exc:
+
+        message = str(exc)
 
         logger.warning(
-            "No formats returned for video ID: %s",
-            info.get("id"),
+            "yt-dlp extraction error for %s: %s",
+            video_id,
+            message
         )
 
         raise HTTPException(
             status_code=422,
             detail={
-                "error": "YouTube returned no playable formats.",
+                "error": message,
 
-                "video_id": info.get("id"),
-
-                "diagnostics": {
-                    "node": NODE_READY,
-                    "node_path": NODE_PATH,
-                    "cookies_configured": bool(
-                        os.getenv("YOUTUBE_COOKIES", "").strip()
-                    ),
-                    "youtube_client": "mweb",
-                    "po_token_provider_ready": POT_READY,
-                    "po_token_provider_error": POT_ERROR,
-                },
-
-                "possible_causes": [
-                    "YouTube player challenge",
-                    "Authentication requirement",
-                    "PO Token generation failure",
-                    "HTTP 429 rate limit",
-                    "Age or region restriction",
-                    "Unavailable video formats",
-                    "Server IP restriction",
-                ],
-
-                "hint": (
-                    "Check Render logs for the original yt-dlp "
-                    "warnings and BgUtils provider status."
+                "code": classify_extraction_error(
+                    message
                 ),
-            },
+
+                "video_id": video_id,
+
+                "diagnostics": build_diagnostics(
+                    video_id
+                )
+            }
         )
 
-    combined, audio, video_only = classify_formats(formats)
+    except Exception as exc:
 
-    if not any((combined, audio, video_only)):
+        logger.exception(
+            "Unexpected extraction error for %s",
+            video_id
+        )
 
         raise HTTPException(
-            status_code=422,
-            detail="No usable direct stream URLs were returned.",
+            status_code=500,
+            detail={
+                "error": str(exc),
+
+                "code": "INTERNAL_EXTRACTION_ERROR",
+
+                "video_id": video_id,
+
+                "diagnostics": build_diagnostics(
+                    video_id
+                )
+            }
         )
-
-    elapsed = round(
-        time.perf_counter() - started,
-        3,
-    )
-
-    return {
-        "success": True,
-
-        "video": {
-            "id": info.get("id"),
-            "title": info.get("title"),
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader"),
-        },
-
-        "streams": {
-            "audio": stream_info(audio, "audio"),
-            "video": stream_info(video_only, "video"),
-            "combined": stream_info(combined, "combined"),
-        },
-
-        "merge_required": combined is None and bool(
-            audio and video_only
-        ),
-
-        "processing_time": elapsed,
-    }
 
 
 # ============================================================
-# FASTAPI LIFESPAN
+# APPLICATION LIFESPAN
 # ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    logger.info("Starting %s", APP_NAME)
+    logger.info(
+        "Starting %s version %s",
+        APP_NAME,
+        APP_VERSION
+    )
 
     initialize_runtime()
+
     check_pot_provider()
+
+    logger.info(
+        "Authentication mode: guest"
+    )
+
+    logger.info(
+        "Google cookies: disabled"
+    )
 
     yield
 
-    logger.info("Shutting down %s", APP_NAME)
+    logger.info(
+        "Shutting down %s",
+        APP_NAME
+    )
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
     title=APP_NAME,
+
     description=(
-        "YouTube video, audio and combined stream extraction API"
+        "YouTube media extraction API "
+        "with guest-mode authentication "
+        "and automatic PO Token support."
     ),
+
     version=APP_VERSION,
-    lifespan=lifespan,
+
+    lifespan=lifespan
 )
 
 
 # ============================================================
-# HOME
+# HOME ENDPOINT
 # ============================================================
 
 @app.get("/")
-def home():
-
-    runtimes = runtime_info()
+async def home():
 
     return {
         "success": True,
+
         "service": APP_NAME,
+
         "version": APP_VERSION,
 
-        "yt_dlp_version": yt_dlp.version.__version__,
+        "status": "online",
 
-        "javascript_runtimes": runtimes,
+        "authentication_mode": "guest",
 
-        "node_ready": NODE_READY,
-        "node_error": NODE_ERROR,
-
-        "cookie_configured": bool(
-            os.getenv("YOUTUBE_COOKIES", "").strip()
-        ),
+        "cookies_required": False,
 
         "youtube_client": "mweb",
 
-        "po_token_provider": {
-            "enabled": True,
-            "ready": POT_READY,
-            "url": POT_PROVIDER_URL,
-            "error": POT_ERROR,
-        },
+        "po_token_provider": POT_PROVIDER_READY,
+
+        "yt_dlp_version": yt_dlp.version.__version__,
 
         "endpoints": {
             "home": "/",
-            "health": "/health",
-            "extract": "/extract?url=YOUTUBE_URL",
-        },
 
-        "supported_streams": [
-            "audio",
-            "video",
-            "combined",
-        ],
+            "health": "/health",
+
+            "extract": "/extract?url=YOUTUBE_URL",
+
+            "docs": "/docs"
+        }
     }
 
 
 # ============================================================
-# HEALTH
+# HEALTH ENDPOINT
 # ============================================================
 
 @app.get("/health")
-def health():
+async def health():
 
     return {
         "success": True,
+
         "status": "healthy",
 
-        "node": NODE_READY,
-        "node_path": NODE_PATH,
-        "node_error": NODE_ERROR,
+        "service": APP_NAME,
 
-        "cookies_configured": bool(
-            os.getenv("YOUTUBE_COOKIES", "").strip()
+        "version": APP_VERSION,
+
+        "uptime": round(
+            time.time() - START_TIME,
+            2
         ),
 
-        "youtube_client": "mweb",
+        "runtime": runtime_info(),
 
-        "po_token_provider_ready": POT_READY,
-        "po_token_provider_error": POT_ERROR,
+        "extraction": {
+            "timeout": DOWNLOAD_TIMEOUT,
 
-        "yt_dlp_version": yt_dlp.version.__version__,
+            "concurrent_extractions": 1
+        }
     }
 
 
 # ============================================================
-# EXTRACT
+# EXTRACTION ENDPOINT
 # ============================================================
 
 @app.get("/extract")
 def extract(
     url: str = Query(
         ...,
-        description="YouTube video URL",
-    ),
+        description="Public YouTube video URL"
+    )
 ):
 
     validate_url(url)
 
-    if not EXTRACTION_LOCK.acquire(blocking=False):
+    acquired = EXTRACTION_LOCK.acquire(
+        timeout=DOWNLOAD_TIMEOUT
+    )
+
+    if not acquired:
 
         raise HTTPException(
-            status_code=429,
-            detail="Another extraction is running. Try again shortly.",
+            status_code=503,
+            detail={
+                "error": "Extraction service is busy.",
+
+                "code": "EXTRACTION_BUSY",
+
+                "retry_after": DOWNLOAD_TIMEOUT
+            }
         )
 
     try:
 
         return extract_video(url)
-
-    except HTTPException:
-        raise
-
-    except DownloadError as exc:
-
-        logger.warning(
-            "YouTube extraction failed: %s",
-            exc,
-        )
-
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "YouTube extraction failed.",
-                "reason": str(exc),
-                "hint": (
-                    "Check Node.js, cookies, BgUtils PO Token "
-                    "provider and yt-dlp logs."
-                ),
-            },
-        ) from exc
-
-    except Exception as exc:
-
-        logger.exception("Unexpected extraction error")
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Unexpected extraction error. Check server logs."
-            ),
-        ) from exc
 
     finally:
 
@@ -790,15 +976,19 @@ def extract(
 
 
 # ============================================================
-# START SERVER
+# APPLICATION ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
 
     uvicorn.run(
-        app,
+        "app:app",
+
         host="0.0.0.0",
+
         port=PORT,
-        workers=1,
-        access_log=False,
+
+        log_level="info",
+
+        workers=1
     )
